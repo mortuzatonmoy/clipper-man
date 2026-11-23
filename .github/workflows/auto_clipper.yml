@@ -59,8 +59,7 @@ jobs:
         run: |
           if [ -n "$YT_COOKIES" ]; then
             umask 077
-            printf '%s
-' "$YT_COOKIES" > "$RUNNER_TEMP/yt_cookies.txt"
+            printf '%s\n' "$YT_COOKIES" > "$RUNNER_TEMP/yt_cookies.txt"
             echo "YT_COOKIES_FILE=$RUNNER_TEMP/yt_cookies.txt" >> "$GITHUB_ENV"
             echo "YT_COOKIES secret found; cookies will be used."
           else
