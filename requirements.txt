@@ -1,0 +1,4 @@
+# Pinned direct dependencies; review newer releases if a provider changes its API.
+# The default extra includes yt-dlp-ejs for YouTube JavaScript challenges.
+yt-dlp[default]==2026.10.26
+chat-downloader==0.2.8

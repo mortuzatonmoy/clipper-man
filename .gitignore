@@ -1,0 +1,15 @@
+output_shorts/
+__pycache__/
+*.py[cod]
+*.mp4
+.env
+.env.*
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+Thumbs.db
+work/
+outputs/

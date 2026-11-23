@@ -1,0 +1,73 @@
+name: Live Stream Auto-Clipper
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "YouTube or Twitch recorded VOD URL (chat replay required)"
+        required: true
+        type: string
+      top_clips:
+        description: "Maximum number of non-overlapping clips"
+        required: true
+        default: "5"
+        type: string
+      clip_duration:
+        description: "Clip duration in seconds"
+        required: true
+        default: "45"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Set up JavaScript runtime for YouTube
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install FFmpeg and Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip check
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Create vertical clips
+        env:
+          VIDEO_URL: ${{ inputs.video_url }}
+          TOP_CLIPS: ${{ inputs.top_clips }}
+          CLIP_DURATION: ${{ inputs.clip_duration }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python auto_clipper.py --url "$VIDEO_URL" --clips "$TOP_CLIPS" --duration "$CLIP_DURATION"
+
+      - name: Upload completed clips (including partial successes)
+        if: ${{ always() && hashFiles('output_shorts/*.mp4') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shorts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output_shorts/*.mp4
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
