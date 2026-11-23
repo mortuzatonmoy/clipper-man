@@ -1,62 +1,49 @@
 # Live Stream Auto-Clipper
 
-Find the busiest moments in a YouTube or Twitch VOD's chat replay and turn them into 1080x1920 vertical MP4s for Shorts, Reels, and TikTok.
+Find the busiest moments in a YouTube or Twitch VOD's chat replay and save them as MP4 clips **with the same width, height, and aspect ratio as the downloaded source stream**. Nothing is cropped, resized, stretched, or padded: a 1920x1080 source gives 1920x1080 clips.
 
-## Run on GitHub (no local installation)
+"Source" means the best video stream yt-dlp can select from YouTube/Twitch (`bv*+ba/b`, sorted by resolution, fps, HDR, codec, bitrate) — not the creator's original upload file.
 
-1. Open **Actions → Live Stream Auto-Clipper → Run workflow** in this repository.
-2. Enter a recorded `video_url`, `top_clips` (default `5`), and `clip_duration` in seconds (default `45`). Select **Run workflow**.
-3. Open the completed run and download **shorts-…** from **Artifacts**. Extract the ZIP to get your MP4s. Artifacts are kept for 7 days.
+This project runs **only through GitHub Actions**.
 
-The workflow must exist on the repository's default branch, and Actions must be enabled. Runs use GitHub-hosted compute and count toward your account's Actions allowance. A job has a 180-minute limit. Successfully completed clips are uploaded even if another clip fails.
+## Run
 
-With an authenticated GitHub CLI, run from the repository directory:
+1. Open **Actions → Live Stream Auto-Clipper → Run workflow**.
+2. Enter a recorded `video_url`, `top_clips` (default `5`), and `clip_duration` in seconds (default `45`).
+3. When the run finishes, download **shorts-…** from **Artifacts** (kept 7 days). Completed clips are uploaded even if another clip fails.
+
+With the GitHub CLI:
 
 ```sh
 gh workflow run auto_clipper.yml --ref main -f video_url="https://www.youtube.com/watch?v=VIDEO_ID" -f top_clips=5 -f clip_duration=45
-gh run list --workflow auto_clipper.yml
 gh run watch RUN_ID
-gh run download RUN_ID --dir downloaded_shorts
+gh run download RUN_ID --dir downloaded_clips
 ```
 
-Use a real video ID. If necessary, authenticate first with `gh auth login --hostname github.com`.
+## YouTube "Sign in to confirm you're not a bot"
 
-## Run locally
+This error is **unrelated to clip dimensions**. YouTube frequently blocks requests from GitHub-hosted runners' datacenter IPs before any video is processed. Twitch VODs are usually unaffected. The reliable workaround is to give yt-dlp signed-in YouTube cookies via an optional repository secret:
 
-Install **Python 3.11+**, **FFmpeg including ffprobe**, and **Node.js 22+ or Deno 2+** on PATH. On Ubuntu, FFmpeg is available through `sudo apt-get install ffmpeg`.
+1. Preferably use a secondary Google account (YouTube can rate-limit or flag accounts used for automation).
+2. Follow yt-dlp's guide to [export YouTube cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies) in Netscape `cookies.txt` format (private window, sign in, export, close the window).
+3. In the repository: **Settings → Secrets and variables → Actions → New repository secret**, name `YT_COOKIES`, paste the entire file contents.
 
-```sh
-python -m venv .venv
-# Linux/macOS:
-source .venv/bin/activate
-# Windows PowerShell instead:
-# .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python auto_clipper.py --url "https://www.twitch.tv/videos/123456789" --clips 5 --duration 45
-```
+The workflow writes the secret to a permission-600 file in the runner's temp directory, passes it to yt-dlp and chat-downloader, and deletes it after the run. GitHub masks secret values in logs; the script logs only whether cookies are in use. Never commit cookies to the repository. Cookies expire; if the error returns, re-export and update the secret. Even with cookies, YouTube may still block some runner IPs — a self-hosted runner on a residential connection is the alternative.
 
-Results appear in `output_shorts/` relative to your working directory. Each run uses unique filenames and preserves earlier clips. `--clips` and `--duration` must be positive integers. Exit codes: `0` success, `1` processing failure (possibly with usable partial results), `2` invalid arguments, `130` interruption.
+## How it works
 
-## How selection and downloads work
+- Stream the full chat replay into 30-second buckets and rank by comment count (ties → earlier).
+- Greedily pick the highest buckets, skipping any whose clip would overlap an already selected clip.
+- Each clip starts 10 seconds before its spike bucket (clamped to 0) and lasts the requested duration (or until the VOD ends).
+- Only that time range is downloaded via yt-dlp `--download-sections` with `--force-keyframes-at-cuts`; there is no whole-VOD fallback.
+- FFmpeg re-encodes to an exact-length H.264/AAC MP4 (CRF 18, fast start) **without any scale/crop/pad filter**; the source frame rate and sample aspect ratio are kept. Even dimensions use yuv420p; odd dimensions use yuv444p so the size still matches. Silent sources get a silent AAC track.
+- ffprobe checks every clip: width, height and SAR must equal the source segment's, codecs must be H.264/AAC, and duration within 0.5 s. Logs show `Source stream: WxH` and `Output clip: WxH` per clip.
+- Raw and partial files are removed automatically; output goes to `output_shorts/` and is uploaded with `actions/upload-artifact@v4`.
 
-- Stream the full chat replay into fixed 30-second buckets. Rank by comment count, breaking ties chronologically. No comment text is saved.
-- Greedily select the highest-count bucket, then skip any bucket whose clip would overlap an already selected clip. This prioritizes individual spikes, not maximum total comments across a combination of clips. Fewer clips may be available than requested.
-- Start each clip 10 seconds before the **start of its spike bucket**, clamped to zero. End after the requested duration or at the VOD's end, whichever comes first. Very short durations may finish before the spike; 45 seconds covers the full bucket and lead-in.
-- Request each time range through yt-dlp's `--download-sections`, with FFmpeg and keyframe correction. There is no whole-VOD fallback. Providers may transfer neighboring keyframes/fragments; exact network byte savings depend on the source's seeking support.
-- Center-crop, encode at 1080x1920/30 fps (H.264, yuv420p, AAC stereo), and enable MP4 fast start. Silent sources receive a silent AAC track. Probe each output before publishing it, and automatically remove raw/partial files on normal completion, failure, or Ctrl+C.
-
-## Requirements and troubleshooting
-
-Use completed, accessible VODs with chat replay. Currently broadcasting streams, channel URLs, deleted VODs, unavailable chat, and login/region-restricted recordings are not supported. YouTube can reject GitHub runner IPs or require sign-in; that appears as an extraction error rather than an empty successful run. This project does not bypass provider access controls. Center-cropping can remove off-center subjects, overlays, or gameplay UI.
-
-Provider APIs change independently of this project. Direct dependency versions are pinned in `requirements.txt`; update and retest them if extraction breaks. A forced process termination or machine shutdown can leave a hidden `.auto_clipper_*` temporary directory under `output_shorts/`; remove it only after confirming no clipper run is active.
+Large sources (e.g. 4K) produce large files and take longer to encode; the job limit is 180 minutes.
 
 ## Tests
 
-```sh
-python -m unittest discover -s tests -v
-```
+The workflow runs `python -m unittest discover -s tests -v` before clipping. Media tests generate synthetic footage (1920x1080, 640x360, portrait 180x400, odd 641x361, anamorphic 720x480 with SAR 32:27) and verify via ffprobe that output dimensions and SAR equal the input. Provider access (YouTube/Twitch) needs a real accessible VOD and is not covered by tests.
 
-Unit tests run offline. Media integration tests use generated footage and run when FFmpeg and ffprobe are available; the Actions workflow installs both. Provider availability requires a real accessible VOD and is separate from these tests.
-
-Implementation references: [yt-dlp](https://github.com/yt-dlp/yt-dlp#usage-and-options), [chat-downloader](https://chat-downloader.readthedocs.io/en/latest/), [workflow dispatch](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatch).
+References: [yt-dlp](https://github.com/yt-dlp/yt-dlp#usage-and-options), [chat-downloader](https://chat-downloader.readthedocs.io/en/latest/), [workflow dispatch](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onworkflow_dispatch).

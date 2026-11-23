@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn chat replay spikes from a recorded YouTube/Twitch VOD into vertical clips."""
+"""Turn chat replay spikes from a recorded YouTube/Twitch VOD into clips that keep the source dimensions."""
 
 from __future__ import annotations
 
@@ -27,6 +27,13 @@ LOG = logging.getLogger("auto_clipper")
 BUCKET_SECONDS = 30
 PRE_ROLL_SECONDS = 10
 OUTPUT_DIR = Path("output_shorts")
+# Best available video+audio streams (no resolution cap); single-file fallback.
+FORMAT_SELECTOR = "bv*+ba/b"
+FORMAT_SORT = "res,fps,hdr:12,vcodec,vbr,abr,asr"
+BOT_CHECK_HINT = (
+    "YouTube often blocks GitHub-hosted runner IPs ('Sign in to confirm you are not a bot'). "
+    "Add a YT_COOKIES repository secret (see README) and run the workflow again."
+)
 
 
 class ClipperError(RuntimeError):
@@ -87,6 +94,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--clips", type=positive_int, default=5, help="Maximum clips (default: 5)")
     parser.add_argument("--duration", type=positive_int, default=45,
                         help="Clip length in seconds (default: 45)")
+    parser.add_argument("--cookies", type=Path, default=os.environ.get("YT_COOKIES_FILE") or None,
+                        help="Optional Netscape cookies.txt (default: $YT_COOKIES_FILE)")
     return parser.parse_args(argv)
 
 
@@ -138,18 +147,30 @@ def run_command(command: list[str], label: str, timeout: int,
     return stdout or ""
 
 
+COOKIES_FILE: Path | None = None
+
+
 def ytdlp_command() -> list[str]:
+    cookies = ["--cookies", str(COOKIES_FILE)] if COOKIES_FILE else []
     return [
         sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-plugin-dirs",
         "--no-playlist", "--no-cache-dir", "--js-runtimes", "node",
         "--socket-timeout", "30", "--retries", "3", "--fragment-retries", "3",
         "--extractor-retries", "3",
-    ]
+    ] + cookies
 
 
 def get_vod_duration(url: str) -> float:
-    raw = run_command(ytdlp_command() + ["--skip-download", "--dump-single-json", "--", url],
-                      "VOD metadata lookup", 180, capture=True)
+    try:
+        raw = run_command(ytdlp_command() + ["--skip-download", "--dump-single-json", "--", url],
+                          "VOD metadata lookup", 180, capture=True)
+    except ClipperError as exc:
+        if "youtube.com" in url:
+            hint = BOT_CHECK_HINT if not COOKIES_FILE else (
+                "Cookies were supplied but YouTube still refused; they may be expired or "
+                "rotated. Re-export them (see README) and update the YT_COOKIES secret.")
+            raise ClipperError(f"{exc}. {hint}") from exc
+        raise
     try:
         info = json.loads(raw)
         if info.get("is_live") or info.get("live_status") in {"is_live", "is_upcoming", "post_live"}:
@@ -192,7 +213,7 @@ def fetch_chat_buckets(url: str, vod_duration: float) -> Counter[int]:
     from chat_downloader import ChatDownloader
 
     LOG.info("Fetching full chat replay (large VODs may take several minutes)...")
-    downloader = ChatDownloader()
+    downloader = ChatDownloader(cookies=str(COOKIES_FILE) if COOKIES_FILE else None)
     try:
         chat = downloader.get_chat(
             url, start_time=0, end_time=vod_duration,
@@ -234,7 +255,7 @@ def download_segment(url: str, moment: Moment, directory: Path) -> Path:
     command = ytdlp_command() + [
         "--download-sections", f"*{moment.start:.3f}-{moment.end:.3f}",
         "--force-keyframes-at-cuts", "--downloader", "ffmpeg",
-        "--format", "bv[height<=1080]+ba/b[height<=1080]/bv[height<=1080]",
+        "--format", FORMAT_SELECTOR, "--format-sort", FORMAT_SORT,
         "--merge-output-format", "mkv", "--newline", "--no-simulate",
         "--output", str(directory / "raw.%(ext)s"), "--", url,
     ]
@@ -257,37 +278,63 @@ def probe_media(path: Path) -> dict:
         raise ClipperError("ffprobe returned invalid metadata") from exc
 
 
-def convert_vertical(source: Path, destination: Path, duration: float) -> None:
+def _first(streams: list[dict], kind: str) -> dict:
+    return next((s for s in streams if s.get("codec_type") == kind), {})
+
+
+def _sar(stream: dict) -> str:
+    value = stream.get("sample_aspect_ratio") or "1:1"
+    return "1:1" if value in {"0:1", "N/A"} else value
+
+
+def video_geometry(metadata: dict) -> tuple[int, int, str]:
+    video = _first(metadata.get("streams", []), "video")
+    try:
+        width, height = int(video["width"]), int(video["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ClipperError("Could not read video dimensions with ffprobe") from exc
+    return width, height, _sar(video)
+
+
+def encode_clip(source: Path, destination: Path, duration: float) -> None:
+    """Re-encode to exact-length H.264/AAC MP4 without crop, scale, pad, or SAR change."""
     metadata = probe_media(source)
     streams = metadata.get("streams", [])
-    if not any(stream.get("codec_type") == "video" for stream in streams):
+    if not _first(streams, "video"):
         raise ClipperError("Downloaded segment contains no video")
-    has_audio = any(stream.get("codec_type") == "audio" for stream in streams)
+    width, height, sar = video_geometry(metadata)
+    LOG.info("Source stream: %dx%d (SAR %s, codec %s)", width, height, sar,
+             _first(streams, "video").get("codec_name"))
+    has_audio = bool(_first(streams, "audio"))
+    # 4:2:0 needs even dimensions; odd sizes keep exact dimensions via 4:4:4.
+    pix_fmt = "yuv420p" if width % 2 == 0 and height % 2 == 0 else "yuv444p"
+    preset = "veryfast" if width * height > 1920 * 1080 else "medium"
     command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-i", str(source)]
     if not has_audio:
         command += ["-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"]
     command += [
         "-map", "0:v:0", "-map", "0:a:0" if has_audio else "1:a:0",
-        # Normalize non-square pixels before cropping; crop before upscaling to save memory.
-        "-vf", "scale=trunc(iw*sar/2)*2:ih,setsar=1,"
-        "crop=w='min(iw,ih*9/16)':h='min(ih,iw*16/9)',"
-        "scale=1080:1920:flags=lanczos,setsar=1,fps=30,format=yuv420p",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-threads", "2",
+        "-vf", f"format={pix_fmt}",
+        "-c:v", "libx264", "-preset", preset, "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-af", "apad", "-t", f"{duration:.3f}", "-shortest",
         "-map_metadata", "-1", "-movflags", "+faststart", str(destination),
     ]
-    run_command(command, "Vertical video conversion", max(600, int(duration * 20)))
+    run_command(command, "H.264/AAC encode", max(900, int(duration * 60)))
     result = probe_media(destination)
-    video = next((s for s in result.get("streams", []) if s.get("codec_type") == "video"), {})
-    audio = next((s for s in result.get("streams", []) if s.get("codec_type") == "audio"), {})
+    out_streams = result.get("streams", [])
+    out_geometry = video_geometry(result)
+    LOG.info("Output clip:   %dx%d (SAR %s)", *out_geometry)
+    if out_geometry != (width, height, sar):
+        raise ClipperError(f"Dimension check failed: source {width}x{height} SAR {sar}, "
+                           f"output {out_geometry[0]}x{out_geometry[1]} SAR {out_geometry[2]}")
+    codecs = (_first(out_streams, "video").get("codec_name"), _first(out_streams, "audio").get("codec_name"))
+    if codecs != ("h264", "aac"):
+        raise ClipperError(f"Output validation failed: expected H.264/AAC, got {codecs}")
     try:
         actual_duration = float(result.get("format", {}).get("duration", 0))
     except (TypeError, ValueError) as exc:
         raise ClipperError("Output duration is invalid") from exc
-    if (video.get("width"), video.get("height"), video.get("codec_name"), audio.get("codec_name")) != (
-            1080, 1920, "h264", "aac"):
-        raise ClipperError("Output validation failed: expected 1080x1920 H.264/AAC")
     if not math.isfinite(actual_duration) or abs(actual_duration - duration) > 0.5:
         raise ClipperError(f"Output duration {actual_duration:.2f}s differs from requested {duration:.2f}s")
 
@@ -305,8 +352,8 @@ def create_clips(url: str, moments: list[Moment], output_dir: Path = OUTPUT_DIR)
             with tempfile.TemporaryDirectory(prefix=".auto_clipper_", dir=output_dir) as temp:
                 directory = Path(temp)
                 source = download_segment(url, moment, directory)
-                ready = directory / "vertical.mp4"
-                convert_vertical(source, ready, moment.end - moment.start)
+                ready = directory / "clip.mp4"
+                encode_clip(source, ready, moment.end - moment.start)
                 destination = output_dir / f"{run_id}_clip_{rank:02d}_{int(moment.start):06d}s.mp4"
                 ready.replace(destination)
                 LOG.info("Saved %s", destination)
@@ -320,7 +367,15 @@ def create_clips(url: str, moments: list[Moment], output_dir: Path = OUTPUT_DIR)
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args(argv)
+    global COOKIES_FILE
     try:
+        if args.cookies:
+            if not args.cookies.is_file() or args.cookies.stat().st_size == 0:
+                raise ClipperError("Cookies file is missing or empty")
+            COOKIES_FILE = args.cookies
+            LOG.info("Using supplied cookies for authentication (contents not logged)")
+        elif "youtube.com" in args.url:
+            LOG.warning("No cookies supplied. %s", BOT_CHECK_HINT)
         check_dependencies(args.url)
         duration = get_vod_duration(args.url)
         buckets = fetch_chat_buckets(args.url, duration)

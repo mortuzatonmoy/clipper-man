@@ -53,7 +53,21 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
-      - name: Create vertical clips
+      - name: Prepare optional YouTube cookies (from secret, never logged)
+        env:
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          if [ -n "$YT_COOKIES" ]; then
+            umask 077
+            printf '%s
+' "$YT_COOKIES" > "$RUNNER_TEMP/yt_cookies.txt"
+            echo "YT_COOKIES_FILE=$RUNNER_TEMP/yt_cookies.txt" >> "$GITHUB_ENV"
+            echo "YT_COOKIES secret found; cookies will be used."
+          else
+            echo "No YT_COOKIES secret; YouTube may block this runner with a bot check."
+          fi
+
+      - name: Create clips (source dimensions preserved)
         env:
           VIDEO_URL: ${{ inputs.video_url }}
           TOP_CLIPS: ${{ inputs.top_clips }}
@@ -61,6 +75,10 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: |
           python auto_clipper.py --url "$VIDEO_URL" --clips "$TOP_CLIPS" --duration "$CLIP_DURATION"
+
+      - name: Remove cookies file
+        if: ${{ always() }}
+        run: rm -f "$RUNNER_TEMP/yt_cookies.txt"
 
       - name: Upload completed clips (including partial successes)
         if: ${{ always() && hashFiles('output_shorts/*.mp4') != '' }}

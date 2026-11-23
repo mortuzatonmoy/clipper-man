@@ -84,6 +84,20 @@ class InputTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def tearDown(self):
+        clipper.COOKIES_FILE = None
+
+    def test_cookies_passed_only_when_set(self):
+        self.assertNotIn("--cookies", clipper.ytdlp_command())
+        clipper.COOKIES_FILE = Path("c.txt")
+        command = clipper.ytdlp_command()
+        self.assertEqual(command[command.index("--cookies") + 1], "c.txt")
+
+    def test_bot_check_hint_on_youtube_failure(self):
+        with patch.object(clipper, "run_command", side_effect=clipper.ClipperError("failed")):
+            with self.assertRaisesRegex(clipper.ClipperError, "YT_COOKIES"):
+                clipper.get_vod_duration(URL)
+
     def test_live_and_unusable_metadata_rejected(self):
         for metadata in [{"is_live": True, "duration": 100}, {"live_status": "post_live"},
                          {"duration": None}, {"duration": float("nan")}, {}]:
@@ -106,6 +120,9 @@ class PipelineTests(unittest.TestCase):
             command = run.call_args.args[0]
             self.assertEqual(command[command.index("--download-sections") + 1], "*50.000-95.000")
             self.assertIn("--force-keyframes-at-cuts", command)
+            fmt = command[command.index("--format") + 1]
+            self.assertEqual(fmt, "bv*+ba/b")
+            self.assertNotIn("height", fmt)
             with patch.object(clipper, "run_command", side_effect=clipper.ClipperError("failed")) as run:
                 with self.assertRaises(clipper.ClipperError):
                     clipper.download_segment(URL, clipper.Moment(2, 10, 50, 95), folder)
@@ -130,7 +147,7 @@ class PipelineTests(unittest.TestCase):
             folder = Path(temp)
             (folder / "previous.mp4").write_bytes(b"previous run")
             with patch.object(clipper, "download_segment", side_effect=download), \
-                    patch.object(clipper, "convert_vertical", side_effect=convert):
+                    patch.object(clipper, "encode_clip", side_effect=convert):
                 status = clipper.create_clips(URL, [clipper.Moment(1, 10, 20, 50),
                                                    clipper.Moment(3, 9, 80, 110)], folder)
             self.assertEqual(status, 1)
@@ -161,28 +178,30 @@ class PipelineTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg/ffprobe not installed")
 class MediaIntegrationTests(unittest.TestCase):
-    def test_vertical_conversion_with_audio_and_silent_portrait(self):
+    def test_dimensions_preserved(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
-            for size, audio in [("640x360", True), ("180x400", False)]:
-                with self.subTest(size=size, audio=audio):
+            for size, audio, sar in [("1920x1080", True, None), ("640x360", True, None),
+                                     ("180x400", False, None), ("641x361", True, None),
+                                     ("720x480", True, "32/27")]:
+                with self.subTest(size=size, audio=audio, sar=sar):
                     source = folder / "source.mkv"
                     output = folder / "result.mp4"
                     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                           "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=30"]
+                           "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=25"]
                     if audio:
-                        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000"]
-                    cmd += ["-t", "1", "-c:v", "libx264", "-preset", "ultrafast"]
+                        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"]
+                    if sar:
+                        cmd += ["-vf", f"setsar={sar}"]
+                    cmd += ["-t", "2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]
                     if audio:
                         cmd += ["-c:a", "aac"]
                     subprocess.run(cmd + [str(source)], check=True, capture_output=True)
-                    clipper.convert_vertical(source, output, 1)
-                    probe = clipper.probe_media(output)
-                    video = next(s for s in probe["streams"] if s["codec_type"] == "video")
-                    self.assertEqual((video["width"], video["height"]), (1080, 1920))
-                    self.assertEqual(video["pix_fmt"], "yuv420p")
-                    self.assertEqual(video["sample_aspect_ratio"], "1:1")
-                    self.assertEqual(video["avg_frame_rate"], "30/1")
+                    clipper.encode_clip(source, output, 1.5)
+                    src = clipper.video_geometry(clipper.probe_media(source))
+                    out = clipper.video_geometry(clipper.probe_media(output))
+                    self.assertEqual(src, out)
+                    self.assertEqual(f"{out[0]}x{out[1]}", size)
                     subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", str(output),
                                     "-f", "null", "-"], check=True, capture_output=True)
 
