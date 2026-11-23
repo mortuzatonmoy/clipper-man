@@ -191,8 +191,8 @@ class MediaIntegrationTests(unittest.TestCase):
                            "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=25"]
                     if audio:
                         cmd += ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"]
-                    if sar:
-                        cmd += ["-vf", f"setsar={sar}"]
+                    # testsrc2 rounds odd sizes; scale guarantees the exact test geometry.
+                    cmd += ["-vf", f"scale={size.replace('x', ':')},setsar={sar or 1}"]
                     cmd += ["-t", "2", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv444p"]
                     if audio:
                         cmd += ["-c:a", "aac"]
